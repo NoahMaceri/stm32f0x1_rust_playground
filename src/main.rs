@@ -4,8 +4,11 @@
 
 use panic_halt as _;
 
-use stm32f0xx_hal as hal;
-use crate::hal::{delay::Delay, pac, prelude::*};
+use stm32f0xx_hal::{
+    delay::Delay,
+    pac,
+    prelude::*,
+};
 
 use cortex_m::peripheral::Peripherals;
 use cortex_m_semihosting::debug;
@@ -15,28 +18,47 @@ use cortex_m_rt::entry;
 use core::fmt::Write;
 use cortex_m_semihosting::hio;
 
+// Switch HAL
+use switch_hal::{ActiveHigh, OutputSwitch, Switch, IntoSwitch, ToggleableOutputSwitch};
+
+// Quick println implementation
+macro_rules! println {
+    ($($arg:tt)*) => {
+        let _ = writeln!(hio::hstdout().unwrap(), $($arg)*);
+    };
+}
+
 #[entry]
 fn main() -> ! {
-    if let (Some(mut p), Some(cp)) = (pac::Peripherals::take(), Peripherals::take()) {
-        let mut rcc = p.RCC.configure().sysclk(8.mhz()).freeze(&mut p.FLASH);
+    // Get peripherals
+    let mut perifs = pac::Peripherals::take().unwrap();
+    let core_perifs = Peripherals::take().unwrap();
 
-        let gpioc = p.GPIOC.split(&mut rcc);
+    // Setup clocks
+    let mut rcc = perifs.RCC.configure().sysclk(8.mhz()).freeze(&mut perifs.FLASH);
+    let mut delay = Delay::new(core_perifs.SYST, &rcc);
 
-        // (Re-)configure PA1 as output
-        let mut blue_led = cortex_m::interrupt::free(move |cs| gpioc.pc8.into_push_pull_output(cs));
+    // Setup GPIO
+    let gpioc = perifs.GPIOC.split(&mut rcc);
 
-        // Get delay provider
-        let mut delay = Delay::new(cp.SYST, &rcc);
+    // Setup blue and green LEDs
+    let (mut blue_led, mut green_led) = cortex_m::interrupt::free(|cs| {
+        (
+            gpioc.pc8.into_push_pull_output(cs).into_active_high_switch(),
+            gpioc.pc9.into_push_pull_output(cs).into_active_high_switch(),
+        )
+    });
 
-        loop {
-            blue_led.toggle().ok();
-            delay.delay_ms(1_000_u16);
-            // Write a message in the console
-            writeln!(hio::hstdout().unwrap(), "Hello, world!").unwrap();
-        }
-    }
+    // Print message
+    println!("LEDs setup!");
+    blue_led.on().unwrap();
+    green_led.off().unwrap();
 
+    // Loop
     loop {
-        continue;
-    }
+        blue_led.toggle().unwrap();
+        green_led.toggle().unwrap();
+        delay.delay_ms(500_u16);
+    };
+
 }
