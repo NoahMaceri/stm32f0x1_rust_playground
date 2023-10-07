@@ -11,6 +11,7 @@ use crate::hal::{
     pac::{interrupt, Interrupt, Peripherals, EXTI, syscfg},
     prelude::*,
     serial::{self, Serial},
+    pwm::{self, PwmChannels},
 };
 
 use core::{cell::RefCell, ops::DerefMut, fmt::Write};
@@ -35,6 +36,9 @@ static INT: Mutex<RefCell<Option<EXTI>>> = Mutex::new(RefCell::new(None));
 
 // Create global systick counter (with mutex)
 static SYSTICK_COUNT: Mutex<RefCell<Option<u32>>> = Mutex::new(RefCell::new(Some(0)));
+
+// PWM (from let mut pwm = pwm::tim1(p.TIM1, pa11, &mut rcc, 1.khz());)
+static PWM: Mutex<RefCell<Option<PwmChannels<stm32f0xx_hal::pac::TIM1, stm32f0xx_hal::pwm::C4>>>> = Mutex::new(RefCell::new(None));
 
 // Semihosted println implementation
 // WARNING: This is very slow and will block the MCU
@@ -124,6 +128,13 @@ fn main() -> ! {
                 &mut rcc,
             );
 
+            // PWM setup
+            let pa11 = gpioa.pa11.into_alternate_af2(cs);
+            let mut pwm = pwm::tim1(p.TIM1, pa11, &mut rcc, 1.khz());
+            let max_duty = pwm.get_max_duty();
+            pwm.set_duty(max_duty / 2);
+            pwm.enable();
+
             // Turn off LED
             blue_led.set_low().unwrap();
             green_led.set_low().unwrap();
@@ -159,6 +170,7 @@ fn main() -> ! {
             *BLUE_LED.borrow(cs).borrow_mut() = Some(blue_led);
             *GREEN_LED.borrow(cs).borrow_mut() = Some(green_led);
             *SYSTICK_OUT.borrow(cs).borrow_mut() = Some(systick_out);
+            *PWM.borrow(cs).borrow_mut() = Some(pwm);
             *USART2.borrow(cs).borrow_mut() = Some(usart2);
             *DELAY.borrow(cs).borrow_mut() = Some(delay);
             *INT.borrow(cs).borrow_mut() = Some(exti);
@@ -187,20 +199,30 @@ fn EXTI0_1() {
     // Enter critical section
     cortex_m::interrupt::free(|cs| {
         // Obtain all Mutex protected resources
-        if let (&mut Some(ref mut blue_led), &mut Some(ref mut green_led), &mut Some(ref mut delay), &mut Some(ref mut exti), &mut Some(ref mut systick_count)) = (
+        if let (
+            &mut Some(ref mut blue_led), 
+            &mut Some(ref mut green_led), 
+            &mut Some(ref mut delay), 
+            &mut Some(ref mut exti), 
+            &mut Some(ref mut systick_count),
+            &mut Some(ref mut pwm),
+        ) = (
             BLUE_LED.borrow(cs).borrow_mut().deref_mut(),
             GREEN_LED.borrow(cs).borrow_mut().deref_mut(),
             DELAY.borrow(cs).borrow_mut().deref_mut(),
             INT.borrow(cs).borrow_mut().deref_mut(),
             SYSTICK_COUNT.borrow(cs).borrow_mut().deref_mut(),
+            PWM.borrow(cs).borrow_mut().deref_mut(),
         ) {
             println!("Button pressed");
             // Turn on LED
             // if count is even, toggle blue, else toggle green
             if *systick_count % 2 == 0 {
                 blue_led.toggle().ok();
+                pwm.disable();
             } else {
                 green_led.toggle().ok();
+                pwm.enable();
             }
 
             // Delay for a second
