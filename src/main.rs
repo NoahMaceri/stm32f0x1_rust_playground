@@ -2,29 +2,21 @@
 #![no_std]
 #![allow(unused_imports)]
 
-use hal::pac::syscfg;
 use panic_halt as _;
 
 use stm32f0xx_hal as hal;
-
 use crate::hal::{
     delay::Delay,
     gpio::*,
-    pac::{interrupt, Interrupt, Peripherals, EXTI},
+    pac::{interrupt, Interrupt, Peripherals, EXTI, syscfg},
     prelude::*,
 };
 
+use core::{cell::RefCell, ops::DerefMut, fmt::Write};
+
 use cortex_m::{interrupt::Mutex, peripheral::Peripherals as c_m_Peripherals};
-use cortex_m_rt::entry;
-
-use core::{cell::RefCell, ops::DerefMut};
-
-// For printing to the host
-use core::fmt::Write;
 use cortex_m_semihosting::hio;
-
-// Swtich HAL
-use switch_hal::{ActiveHigh, InputSwitch, IntoSwitch, OutputSwitch, Switch};
+use cortex_m_rt::entry;
 
 // Make our LED globally available
 static BLUE_LED: Mutex<RefCell<Option<gpioc::PC8<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
@@ -36,8 +28,8 @@ static DELAY: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
 // Make external interrupt registers globally available
 static INT: Mutex<RefCell<Option<EXTI>>> = Mutex::new(RefCell::new(None));
 
-
-// Quick println implementation
+// Semihosted println implementation
+// WARNING: This is very slow and will block the MCU
 macro_rules! println {
     ($($arg:tt)*) => {
         let _ = writeln!(hio::hstdout().unwrap(), $($arg)*);
@@ -46,6 +38,7 @@ macro_rules! println {
 
 #[entry]
 fn main() -> ! {
+    // Execute all setup in a critical section
     if let (Some(p), Some(cp)) = (Peripherals::take(), c_m_Peripherals::take()) {
         cortex_m::interrupt::free(move |cs| {
             // Enable clock for SYSCFG
@@ -53,7 +46,49 @@ fn main() -> ! {
             rcc.apb2enr.modify(|_, w| w.syscfgen().set_bit());
 
             let mut flash = p.FLASH;
-            let mut rcc = rcc.configure().sysclk(8.mhz()).freeze(&mut flash);
+            // let mut rcc = rcc.configure().sysclk(8.mhz()).freeze(&mut flash);
+            // Instead of the internal 8MHz RC oscillator, we will use the external 8MHz crystal on the discovery board
+            // HSE Bypassmode is not used, as a crystal is directly connected to the OSC_IN and OSC_OUT pins
+            let mut rcc = rcc.configure().hse(8.mhz(), hal::rcc::HSEBypassMode::NotBypassed).freeze(&mut flash);
+
+            // Get other system info and print
+            let (hclk_mhz, pclk_mhz, sysclk_mhz) = 
+            (
+                rcc.clocks.hclk().0 / 1_000_000, 
+                rcc.clocks.pclk().0 / 1_000_000, 
+                rcc.clocks.sysclk().0 / 1_000_000
+            );
+            println!("SYSCLK: {} Hz\nHCLK: {} Hz\nPCLK: {} Hz", sysclk_mhz, hclk_mhz, pclk_mhz);
+
+            // Get CPUID 
+            unsafe {
+                let cpuid: u32 = cortex_m::peripheral::CPUID::PTR.read().base.read();
+                let implementer = ((cpuid & 0xff00_0000) >> 24) as u8;
+                // Decode implementer to str
+                let implementer_str = match implementer {
+                    0x41 => "ARM",
+                    _ => "Other"
+                };
+                let variant = ((cpuid & 0x00f0_0000) >> 20) as u8;
+                let architecture = ((cpuid & 0x000f_0000) >> 16) as u8;
+                // Decode architecture to str
+                let architecture_str = match architecture {
+                    0xC => "ARMv6-M",
+                    _ => "Other"
+                };
+                let partno = ((cpuid & 0x0000_fff0) >> 4) as u16;
+                // Decode partno to str
+                let partno_str = match partno {
+                    0xC20 => "Cortex-M0",
+                    0xC60 => "Cortex-M0+",
+                    0xC21 => "Cortex-M1",
+                    0xC23 => "Cortex-M3",
+                    0xC24 => "Cortex-M4",
+                    0xC27 => "Cortex-M7",
+                    _ => "Other"
+                };
+                let revision = (cpuid & 0x0000_000f) as u8;
+                println!("Implementer: {}\nVariant: {}\nArchitecture: {}\nPartno: {}\nRevision: {}", implementer_str, variant, architecture_str, partno_str, revision);            }
 
             let gpioa = p.GPIOA.split(&mut rcc);
             let gpioc = p.GPIOC.split(&mut rcc);
