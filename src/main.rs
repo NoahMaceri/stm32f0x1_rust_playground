@@ -10,23 +10,31 @@ use crate::hal::{
     gpio::*,
     pac::{interrupt, Interrupt, Peripherals, EXTI, syscfg},
     prelude::*,
+    serial::{self, Serial},
 };
 
 use core::{cell::RefCell, ops::DerefMut, fmt::Write};
 
-use cortex_m::{interrupt::Mutex, peripheral::Peripherals as c_m_Peripherals};
+use cortex_m::{interrupt::Mutex, peripheral::Peripherals as c_m_Peripherals, peripheral::syst::SystClkSource::Core};
 use cortex_m_semihosting::hio;
-use cortex_m_rt::entry;
+use cortex_m_rt::{entry, exception};
 
 // Make our LED globally available
 static BLUE_LED: Mutex<RefCell<Option<gpioc::PC8<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
 static GREEN_LED: Mutex<RefCell<Option<gpioc::PC9<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
+static SYSTICK_OUT: Mutex<RefCell<Option<gpioc::PC7<Output<PushPull>>>>> = Mutex::new(RefCell::new(None));
+
+// USART2
+static USART2: Mutex<RefCell<Option<Serial<stm32f0xx_hal::pac::USART2, gpioa::PA2<Alternate<AF1>>, gpioa::PA3<Alternate<AF1>>>>>> = Mutex::new(RefCell::new(None));
 
 // Make our delay provider globally available
 static DELAY: Mutex<RefCell<Option<Delay>>> = Mutex::new(RefCell::new(None));
 
 // Make external interrupt registers globally available
 static INT: Mutex<RefCell<Option<EXTI>>> = Mutex::new(RefCell::new(None));
+
+// Create global systick counter (with mutex)
+static SYSTICK_COUNT: Mutex<RefCell<Option<u32>>> = Mutex::new(RefCell::new(Some(0)));
 
 // Semihosted println implementation
 // WARNING: This is very slow and will block the MCU
@@ -95,17 +103,30 @@ fn main() -> ! {
             let syscfg = p.SYSCFG;
             let exti = p.EXTI;
 
+            let mut syst = cp.SYST;
+
             let _ = gpioa.pa0.into_pull_down_input(cs);
 
             let mut blue_led = gpioc.pc8.into_push_pull_output(cs);
             let mut green_led = gpioc.pc9.into_push_pull_output(cs);
 
+            let systick_out = gpioc.pc7.into_push_pull_output(cs);
+
+            // Init USART 2 (PA3 - RX, PA2 - TX)
+            let tx = gpioa.pa2.into_alternate_af1(cs);
+            let rx = gpioa.pa3.into_alternate_af1(cs);
+            
+            // expected struct `Serial<USART2, (PA2<Alternate<AF1>>, PA3<Alternate<AF1>>), u32>` 
+            let usart2 = Serial::usart2(
+                p.USART2,
+                (tx, rx),
+                115_200.bps(),
+                &mut rcc,
+            );
+
             // Turn off LED
             blue_led.set_low().unwrap();
             green_led.set_low().unwrap();
-
-            // Initialise delay provider
-            let delay = Delay::new(cp.SYST, &rcc);
 
             // Enable external interrupt
             syscfg.exticr1.modify(|_, w| unsafe { w.exti0().bits(0) });
@@ -116,9 +137,29 @@ fn main() -> ! {
             // Set interrupt falling trigger
             exti.ftsr.modify(|_, w| w.tr0().set_bit());
 
+            // Initialise SysTick counter with a defined value
+            unsafe { syst.cvr.write(1) };
+
+            // Set source for SysTick counter, here full operating frequency (== 48MHz)
+            syst.set_clock_source(Core);
+
+            // Make it so it outputs the clock on SystickOut
+            syst.set_reload(rcc.clocks.sysclk().0 - 1);
+
+            // Start SysTick counter
+            syst.enable_counter();
+
+            // Start SysTick interrupt generation
+            syst.enable_interrupt();
+            
+            // Initialise delay provider
+            let delay = Delay::new(syst, &rcc);
+
             // Move control over LED and DELAY and EXTI into global mutexes
             *BLUE_LED.borrow(cs).borrow_mut() = Some(blue_led);
             *GREEN_LED.borrow(cs).borrow_mut() = Some(green_led);
+            *SYSTICK_OUT.borrow(cs).borrow_mut() = Some(systick_out);
+            *USART2.borrow(cs).borrow_mut() = Some(usart2);
             *DELAY.borrow(cs).borrow_mut() = Some(delay);
             *INT.borrow(cs).borrow_mut() = Some(exti);
 
@@ -130,11 +171,13 @@ fn main() -> ! {
             }
             cortex_m::peripheral::NVIC::unpend(Interrupt::EXTI0_1);
         });
+
     }
 
     loop {
         continue;
     }
+
 }
 
 // Define an interupt handler, i.e. function to call when interrupt occurs. Here if our external
@@ -144,22 +187,49 @@ fn EXTI0_1() {
     // Enter critical section
     cortex_m::interrupt::free(|cs| {
         // Obtain all Mutex protected resources
-        if let (&mut Some(ref mut blue_led), &mut Some(ref mut green_led), &mut Some(ref mut delay), &mut Some(ref mut exti)) = (
+        if let (&mut Some(ref mut blue_led), &mut Some(ref mut green_led), &mut Some(ref mut delay), &mut Some(ref mut exti), &mut Some(ref mut systick_count)) = (
             BLUE_LED.borrow(cs).borrow_mut().deref_mut(),
             GREEN_LED.borrow(cs).borrow_mut().deref_mut(),
             DELAY.borrow(cs).borrow_mut().deref_mut(),
             INT.borrow(cs).borrow_mut().deref_mut(),
+            SYSTICK_COUNT.borrow(cs).borrow_mut().deref_mut(),
         ) {
             println!("Button pressed");
             // Turn on LED
-            blue_led.toggle().ok();
-            green_led.toggle().ok();
+            // if count is even, toggle blue, else toggle green
+            if *systick_count % 2 == 0 {
+                blue_led.toggle().ok();
+            } else {
+                green_led.toggle().ok();
+            }
 
             // Delay for a second
             delay.delay_ms(250_u16);
 
             // Clear event triggering the interrupt
             exti.pr.write(|w| w.pr0().set_bit());
+        }
+    });
+}
+
+// Define an exception handler, i.e. function to call when exception occurs. Here, if our SysTick
+// timer generates an exception the following handler will be called
+#[exception]
+fn SysTick() {
+    // Enter critical section
+    cortex_m::interrupt::free(|cs| {
+        // Borrow access to our GPIO pin from the shared structure
+        if let (Some(ref mut systick_out), Some(ref mut usart2), &mut Some(ref mut systick_count)) = (
+            SYSTICK_OUT.borrow(cs).borrow_mut().deref_mut(),
+            USART2.borrow(cs).borrow_mut().deref_mut(),
+            SYSTICK_COUNT.borrow(cs).borrow_mut().deref_mut(),
+        ) {
+            systick_out.toggle().ok();
+            // increment count
+            *systick_count += 1;
+
+            // Send pretty formatted message
+            writeln!(usart2, "SysTick interrupt no. {}", *systick_count).unwrap()
         }
     });
 }
