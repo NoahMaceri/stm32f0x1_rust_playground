@@ -53,16 +53,78 @@ fn main() -> ! {
     // Execute all setup in a critical section
     if let (Some(p), Some(cp)) = (Peripherals::take(), c_m_Peripherals::take()) {
         cortex_m::interrupt::free(move |cs| {
-            // Enable clock for SYSCFG
             let rcc = p.RCC;
-            rcc.apb2enr.modify(|_, w| w.syscfgen().set_bit());
-
             let mut flash = p.FLASH;
-            // let mut rcc = rcc.configure().sysclk(8.mhz()).freeze(&mut flash);
-            // Instead of the internal 8MHz RC oscillator, we will use the external 8MHz crystal on the discovery board
-            // HSE Bypassmode is not used, as a crystal is directly connected to the OSC_IN and OSC_OUT pins
-            let mut rcc = rcc.configure().hse(8.mhz(), hal::rcc::HSEBypassMode::NotBypassed).freeze(&mut flash);
-
+            /* 
+            *=============================================================================
+            *=============================================================================
+            *        System Clock source                    | PLL (HSE)
+            *-----------------------------------------------------------------------------
+            *        SYSCLK(Hz)                             | 48000000
+            *-----------------------------------------------------------------------------
+            *        HCLK(Hz)                               | 48000000
+            *-----------------------------------------------------------------------------
+            *        AHB Prescaler                          | 1
+            *-----------------------------------------------------------------------------
+            *        APB Prescaler                          | 1
+            *-----------------------------------------------------------------------------
+            *        HSE Frequency(Hz)                      | 8000000
+            *----------------------------------------------------------------------------
+            *        PLLMUL                                 | 6
+            *-----------------------------------------------------------------------------
+            *        PREDIV                                 | 1
+            *-----------------------------------------------------------------------------
+            *        Flash Latency(WS)                      | 0
+            *-----------------------------------------------------------------------------
+            *        Prefetch Buffer                        | ON
+            *-----------------------------------------------------------------------------
+            ******************************************************************************
+            */
+            /* Set HSION bit */
+            rcc.cr.modify(|_, w| w.hsion().set_bit());
+            /* Reset SW[1:0], HPRE[3:0], PPRE[2:0], ADCPRE and MCOSEL[2:0] bits */
+            rcc.cfgr.modify(|_, w| unsafe { w.bits(0xF8FFB80C) });
+            /* Reset HSEON, CSSON and PLLON bits */
+            rcc.cr.modify(|_, w| unsafe { w.bits(0xFEF6FFFF) });
+            /* Reset HSEBYP bit */
+            rcc.cr.modify(|_, w| unsafe { w.bits(0xFFFBFFFF) });
+            /* Reset PLLSRC, PLLXTPRE and PLLMUL[3:0] bits */
+            rcc.cfgr.modify(|_, w| unsafe { w.bits(0xFFC0FFFF) });
+            /* Reset PREDIV1[3:0] bits */
+            rcc.cfgr2.modify(|_, w| unsafe { w.bits(0xFFFFFFF0) });
+            /* Reset USARTSW[1:0], I2CSW, CECSW and ADCSW bits */
+            rcc.cfgr3.modify(|_, w| unsafe { w.bits(0xFFFFFEAC) });
+            /* Reset HSI14 bit */
+            rcc.cr2.modify(|_, w| unsafe { w.bits(0xFFFFFFFE) });
+            /* Disable all interrupts */
+            rcc.cir.modify(|_, w| unsafe { w.bits(0x00000000) });
+            // PLL (clocked by HSE) used as System clock source      
+            /* Wait till HSE is ready and if Time out is reached exit */
+            let mut startup_counter = 0;
+            while rcc.cr.read().hserdy().bit_is_clear() {
+                startup_counter += 1;
+                if startup_counter > 10000 {
+                    panic!("HSE startup timeout");
+                }
+            }
+            /* Enable Prefetch Buffer and Flash 0 wait state */
+            flash.acr.modify(|_, w| w.prftbe().set_bit());
+            /* HCLK = SYSCLK / 1 */
+            rcc.cfgr.modify(|_, w| unsafe { w.hpre().bits(0) });
+            /* PCLK = HCLK / 1 */
+            rcc.cfgr.modify(|_, w| unsafe { w.ppre().bits(0) });
+            /* PLL configuration */
+            rcc.cfgr.modify(|_, w| unsafe { w.pllmul().bits(0b110) });
+            /* Enable PLL */
+            rcc.cr.modify(|_, w| w.pllon().set_bit());
+            /* Wait till PLL is ready */
+            while rcc.cr.read().pllrdy().bit_is_clear() {}
+            /* Select PLL as system clock source */
+            rcc.cfgr.modify(|_, w| unsafe { w.sw().bits(0b10) });
+            /* Wait till PLL is used as system clock source */
+            while rcc.cfgr.read().sws().bits() != 0b10 {}
+            
+            let mut rcc = rcc.configure().hse(48.mhz(), hal::rcc::HSEBypassMode::NotBypassed).freeze(&mut flash);
             // Get other system info and print
             let (hclk_mhz, pclk_mhz, sysclk_mhz) = 
             (
